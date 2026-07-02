@@ -18,6 +18,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -39,8 +41,11 @@ import (
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/net/http/httpguts"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+	caddymetrics "github.com/caddyserver/caddy/v2/internal/metrics"
 	"github.com/caddyserver/caddy/v2/modules/caddyevents"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/headers"
@@ -399,6 +404,10 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	// set up upstreams
 	for _, u := range h.Upstreams {
 		h.provisionUpstream(u, false)
+		// Track each upstream metric with the metrics tracker
+		for _, vec := range upstreamMetricVecs() {
+			ctx.MetricsTracker().RegisterMetric(vec, prometheus.Labels{"upstream": u.Dial})
+		}
 	}
 
 	if h.HealthChecks != nil {
@@ -527,6 +536,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	// from previous tries because of the nuances of load balancing & retries
 	var proxyErr error
 	var retries int
+	var prevUpstream string
 	for {
 		// if the request body was buffered (and only the entire body, hence no body
 		// set to read from after the buffer), make reading from the body idempotent
@@ -538,7 +548,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 
 		var done bool
-		done, proxyErr = h.proxyLoopIteration(clonedReq, r, w, proxyErr, start, retries, repl, reqHeader, reqHost, next)
+		done, proxyErr = h.proxyLoopIteration(clonedReq, r, w, proxyErr, start, retries, &prevUpstream, repl, reqHeader, reqHost, next)
 		if done {
 			break
 		}
@@ -569,7 +579,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 // It returns true when the loop is done and should break; false otherwise. The error value returned should
 // be assigned to the proxyErr value for the next iteration of the loop (or the error handled after break).
 func (h *Handler) proxyLoopIteration(r *http.Request, origReq *http.Request, w http.ResponseWriter, proxyErr error, start time.Time, retries int,
-	repl *caddy.Replacer, reqHeader http.Header, reqHost string, next caddyhttp.Handler,
+	prevUpstream *string, repl *caddy.Replacer, reqHeader http.Header, reqHost string, next caddyhttp.Handler,
 ) (bool, error) {
 	// get the updated list of upstreams
 	upstreams := h.Upstreams
@@ -612,6 +622,13 @@ func (h *Handler) proxyLoopIteration(r *http.Request, origReq *http.Request, w h
 		}
 		return false, proxyErr
 	}
+
+	// only count a redispatch if previous upstream was different and error was a connection error.
+	var dialErr DialError
+	if errors.As(proxyErr, &dialErr) && *prevUpstream != "" && *prevUpstream != upstream.Dial {
+		reverseProxyMetrics.upstreamRedispatches.With(prometheus.Labels{"upstream": upstream.Dial}).Inc()
+	}
+	*prevUpstream = upstream.Dial
 
 	// the dial address may vary per-request if placeholders are
 	// used, so perform those replacements here; the resulting
@@ -686,12 +703,14 @@ func (h *Handler) proxyLoopIteration(r *http.Request, origReq *http.Request, w h
 	// successfully - only the response content triggered a retry
 	if _, isRetryableResponse := proxyErr.(retryableResponseError); !isRetryableResponse {
 		h.countFailure(upstream)
+		reverseProxyMetrics.upstreamResponseErrors.With(prometheus.Labels{"upstream": upstream.Dial}).Inc()
 	}
 
 	// if we've tried long enough, break
 	if !h.LoadBalancing.tryAgain(h.ctx, start, retries, proxyErr, r, h.logger) {
 		return true, proxyErr
 	}
+	reverseProxyMetrics.upstreamRetries.With(prometheus.Labels{"upstream": upstream.Dial}).Inc()
 
 	return false, proxyErr
 }
@@ -952,6 +971,71 @@ func (h Handler) addForwardedHeaders(req *http.Request) error {
 	return nil
 }
 
+func durationStatus(err error) string {
+	if err != nil {
+		return "error"
+	}
+	return "success"
+}
+
+// dnsStatus classifies DNS errors into common categories for the "status" metric label.
+func dnsStatus(err error) string {
+	if err == nil {
+		return "success"
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		switch {
+		case dnsErr.IsTimeout:
+			return "timeout"
+		case dnsErr.IsNotFound:
+			return "nxdomain"
+		}
+	}
+	return "other"
+}
+
+// tlsStatus classifies TLS handshake errors into common categories for the "status" metric label.
+func tlsStatus(err error) string {
+	if err == nil {
+		return "success"
+	}
+	var (
+		hostErr x509.HostnameError
+		authErr x509.UnknownAuthorityError
+		invErr  x509.CertificateInvalidError
+		netErr  net.Error
+	)
+	switch {
+	case errors.As(err, &hostErr):
+		return "hostname_mismatch"
+	case errors.As(err, &authErr):
+		return "untrusted"
+	case errors.As(err, &invErr):
+		if invErr.Reason == x509.Expired {
+			return "cert_expired"
+		}
+		return "cert_invalid"
+	case errors.As(err, &netErr) && netErr.Timeout():
+		return "timeout"
+	}
+	return "other"
+}
+
+// countingReadCloser wraps io.ReadCloser and increments the given counter by the number of bytes read.
+type countingReadCloser struct {
+	io.ReadCloser
+	counter prometheus.Counter
+}
+
+func (c countingReadCloser) Read(p []byte) (int, error) {
+	n, err := c.ReadCloser.Read(p)
+	if n > 0 {
+		c.counter.Add(float64(n))
+	}
+	return n, err
+}
+
 // reverseProxy performs a round-trip to the given backend and processes the response with the client.
 // (This method is mostly the beginning of what was borrowed from the net/http/httputil package in the
 // Go standard library which was used as the foundation.)
@@ -961,11 +1045,17 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origRe
 	// Increment the in-flight request count
 	incInFlightRequest(di.Address)
 
+	requestLabels := prometheus.Labels{"upstream": di.Upstream.Dial}
+	reverseProxyMetrics.upstreamRequestsTotal.With(requestLabels).Inc()
+	reverseProxyMetrics.upstreamRequestsInFlight.With(requestLabels).Inc()
+	reverseProxyMetrics.upstreamLastSession.With(requestLabels).SetToCurrentTime()
+
 	//nolint:errcheck
 	defer func() {
 		di.Upstream.Host.countRequest(-1)
 		// Decrement the in-flight request count
 		decInFlightRequest(di.Address)
+		reverseProxyMetrics.upstreamRequestsInFlight.With(requestLabels).Dec()
 	}()
 
 	// point the request to this upstream
@@ -979,6 +1069,12 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origRe
 		roundTripMutex sync.Mutex
 		roundTripDone  bool
 	)
+	// Connect/response duration timing
+	var connectStart time.Time
+	var tlsStart time.Time
+	var dnsStart time.Time
+	var gotConnTime time.Time
+	upstreamLabels := prometheus.Labels{"upstream": di.Upstream.Dial}
 	trace := &httptrace.ClientTrace{
 		Got1xxResponse: func(code int, header textproto.MIMEHeader) error {
 			roundTripMutex.Lock()
@@ -998,13 +1094,71 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origRe
 
 			return nil
 		},
+
+		ConnectStart: func(network, addr string) {
+			connectStart = time.Now()
+			reverseProxyMetrics.upstreamConnAttempts.With(upstreamLabels).Inc()
+		},
+		ConnectDone: func(network, addr string, err error) {
+			reverseProxyMetrics.upstreamConnectDuration.
+				With(prometheus.Labels{"upstream": di.Upstream.Dial, "status": durationStatus(err)}).
+				Observe(time.Since(connectStart).Seconds())
+			if err != nil {
+				reverseProxyMetrics.upstreamConnErrors.With(upstreamLabels).Inc()
+			}
+		},
+		GotConn: func(info httptrace.GotConnInfo) {
+			gotConnTime = time.Now()
+			if info.Reused {
+				reverseProxyMetrics.upstreamConnReuses.With(upstreamLabels).Inc()
+			}
+		},
+
+		DNSStart: func(info httptrace.DNSStartInfo) {
+			dnsStart = time.Now()
+		},
+		DNSDone: func(info httptrace.DNSDoneInfo) {
+			reverseProxyMetrics.upstreamDNSDuration.
+				With(prometheus.Labels{"upstream": di.Upstream.Dial, "status": dnsStatus(info.Err)}).
+				Observe(time.Since(dnsStart).Seconds())
+		},
+		TLSHandshakeStart: func() {
+			tlsStart = time.Now()
+		},
+		TLSHandshakeDone: func(state tls.ConnectionState, err error) {
+			reverseProxyMetrics.upstreamTLSDuration.
+				With(prometheus.Labels{"upstream": di.Upstream.Dial, "status": tlsStatus(err)}).
+				Observe(time.Since(tlsStart).Seconds())
+			if err != nil {
+				reverseProxyMetrics.upstreamTLSErrors.With(upstreamLabels).Inc()
+			} else {
+				reverseProxyMetrics.upstreamTLSHandshakes.
+					With(prometheus.Labels{"upstream": di.Upstream.Dial, "resumed": strconv.FormatBool(state.DidResume)}).
+					Inc()
+			}
+		},
+		GotFirstResponseByte: func() {
+			if !gotConnTime.IsZero() {
+				reverseProxyMetrics.upstreamResponseDuration.
+					With(upstreamLabels).
+					Observe(time.Since(gotConnTime).Seconds())
+			} else if c := h.logger.Check(zapcore.WarnLevel, "dropped time-to-first-byte observation: GotConn did not fire"); c != nil {
+				c.Write(zap.String("upstream", di.Upstream.Dial))
+			}
+		},
 	}
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+	if req.Body != nil {
+		req.Body = countingReadCloser{ReadCloser: req.Body, counter: reverseProxyMetrics.upstreamSentBytes.With(upstreamLabels)}
+	}
 
 	// do the round-trip
 	start := time.Now()
 	res, err := h.Transport.RoundTrip(req)
 	duration := time.Since(start)
+	reverseProxyMetrics.upstreamDuration.
+		With(prometheus.Labels{"upstream": di.Upstream.Dial, "status": durationStatus(err)}).
+		Observe(duration.Seconds())
 
 	// record that the round trip is done for the 1xx response handler
 	roundTripMutex.Lock()
@@ -1030,6 +1184,15 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origRe
 		}
 		return err
 	}
+
+	reverseProxyMetrics.upstreamResponsesTotal.With(prometheus.Labels{
+		"upstream": di.Upstream.Dial,
+		"code":     caddymetrics.SanitizeCode(res.StatusCode),
+	}).Inc()
+	if res.Body != nil {
+		res.Body = countingReadCloser{ReadCloser: res.Body, counter: reverseProxyMetrics.upstreamReceivedBytes.With(upstreamLabels)}
+	}
+
 	if c := logger.Check(zapcore.DebugLevel, logMessage); c != nil {
 		c.Write(
 			zap.Object("headers", caddyhttp.LoggableHTTPHeader{
@@ -1141,6 +1304,7 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origRe
 			handler:  h,
 			response: res,
 			start:    start,
+			upstream: di.Upstream.Dial,
 			logger:   logger,
 		}
 		ctx := origReq.Context()
@@ -1171,7 +1335,7 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origRe
 	}
 
 	// copy the response body and headers back to the upstream client
-	return h.finalizeResponse(rw, req, res, repl, start, logger)
+	return h.finalizeResponse(rw, req, res, repl, start, di.Upstream.Dial, logger)
 }
 
 // finalizeResponse prepares and copies the response.
@@ -1181,6 +1345,7 @@ func (h *Handler) finalizeResponse(
 	res *http.Response,
 	repl *caddy.Replacer,
 	start time.Time,
+	upstream string,
 	logger *zap.Logger,
 ) error {
 	// deal with 101 Switching Protocols responses: (WebSocket, h2c, etc)
@@ -1246,6 +1411,15 @@ func (h *Handler) finalizeResponse(
 		// see issue https://github.com/caddyserver/caddy/issues/5951
 		if c := logger.Check(zapcore.WarnLevel, "aborting with incomplete response"); c != nil {
 			c.Write(zap.Error(err))
+		}
+		abortLabels := prometheus.Labels{"upstream": upstream}
+		var rerr readError
+		var werr writeError
+		switch {
+		case errors.As(err, &rerr):
+			reverseProxyMetrics.upstreamServerAborts.With(abortLabels).Inc()
+		case errors.As(err, &werr):
+			reverseProxyMetrics.upstreamClientAborts.With(abortLabels).Inc()
 		}
 		// no extra logging from stdlib
 		panic(http.ErrAbortHandler)
@@ -1817,6 +1991,9 @@ type handleResponseContext struct {
 	// start is the time just before the proxy roundtrip was
 	// performed, used for logging.
 	start time.Time
+
+	// upstream is the dial address of the upstream.
+	upstream string
 
 	// logger is the prepared logger which is used to write logs
 	// with the request, duration, and selected upstream attached.

@@ -26,9 +26,11 @@ import (
 	"os"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/mholt/acmez/v3"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
@@ -426,6 +428,18 @@ func (p *ConnectionPolicy) buildStandardTLSConfig(ctx caddy.Context) error {
 	}
 
 	setDefaultTLSParams(cfg)
+	initTLSMetrics(ctx.GetMetricsRegistry())
+	// Wrap existing VerifyConnection to update handshake metrics
+	existingVerify := cfg.VerifyConnection
+	cfg.VerifyConnection = func(cs tls.ConnectionState) error {
+		if existingVerify != nil {
+			if err := existingVerify(cs); err != nil {
+				return err
+			}
+		}
+		tlsMetrics.handshakes.With(prometheus.Labels{"resumed": strconv.FormatBool(cs.DidResume)}).Inc()
+		return nil
+	}
 
 	p.TLSConfig = cfg
 

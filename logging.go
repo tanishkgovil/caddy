@@ -417,7 +417,12 @@ func (cl *BaseLog) buildCore() {
 			cl.Sampling.Thereafter = 100
 		}
 		c = zapcore.NewSamplerWithOptions(c, cl.Sampling.Interval,
-			cl.Sampling.First, cl.Sampling.Thereafter)
+			cl.Sampling.First, cl.Sampling.Thereafter,
+			zapcore.SamplerHook(func(_ zapcore.Entry, dec zapcore.SamplingDecision) {
+				if dec&zapcore.LogDropped > 0 {
+					globalMetrics.droppedLogs.Inc()
+				}
+			}))
 	}
 	cl.core = c
 }

@@ -30,6 +30,8 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
@@ -381,6 +383,17 @@ func (h *Handler) doActiveHealthCheckForAllHosts() {
 	}
 }
 
+// checkFailReason is a set of reasons for why a health check failed
+type checkFailReason string
+
+const (
+	checkFailDialError checkFailReason = "dial_error" // fallback default reason
+	checkFailTimeout   checkFailReason = "timeout"
+	checkFailBadStatus checkFailReason = "bad_status"
+	checkFailBodyRead  checkFailReason = "body_read_error"
+	checkFailBadBody   checkFailReason = "bad_body"
+)
+
 // doActiveHealthCheck performs a health check to upstream which
 // can be reached at address hostAddr. The actual address for
 // the request will be built according to active health checker
@@ -461,7 +474,8 @@ func (h *Handler) doActiveHealthCheck(dialInfo DialInfo, hostAddr string, networ
 		}
 	}
 
-	markUnhealthy := func() {
+	markUnhealthy := func(reason checkFailReason) {
+		reverseProxyMetrics.upstreamCheckFailures.With(prometheus.Labels{"upstream": upstream.Dial, "reason": string(reason)}).Inc()
 		// increment failures and then check if it has reached the threshold to mark unhealthy
 		err := upstream.Host.countHealthFail(1)
 		if err != nil {
@@ -476,6 +490,8 @@ func (h *Handler) doActiveHealthCheck(dialInfo DialInfo, hostAddr string, networ
 		if upstream.Host.activeHealthFails() >= h.HealthChecks.Active.Fails {
 			// dispatch an event that the host newly became unhealthy
 			if upstream.setHealthy(false) {
+				reverseProxyMetrics.upstreamCheckUpDown.With(prometheus.Labels{"upstream": upstream.Dial}).Inc()
+				reverseProxyMetrics.upstreamsHealthy.With(prometheus.Labels{"upstream": upstream.Dial}).Set(0)
 				h.events.Emit(h.ctx, "unhealthy", map[string]any{"host": hostAddr})
 				upstream.Host.resetHealth()
 			}
@@ -496,6 +512,8 @@ func (h *Handler) doActiveHealthCheck(dialInfo DialInfo, hostAddr string, networ
 		}
 		if upstream.Host.activeHealthPasses() >= h.HealthChecks.Active.Passes {
 			if upstream.setHealthy(true) {
+				reverseProxyMetrics.upstreamCheckUpDown.With(prometheus.Labels{"upstream": upstream.Dial}).Inc()
+				reverseProxyMetrics.upstreamsHealthy.With(prometheus.Labels{"upstream": upstream.Dial}).Set(1)
 				if c := h.HealthChecks.Active.logger.Check(zapcore.InfoLevel, "host is up"); c != nil {
 					c.Write(zap.String("host", hostAddr))
 				}
@@ -506,7 +524,9 @@ func (h *Handler) doActiveHealthCheck(dialInfo DialInfo, hostAddr string, networ
 	}
 
 	// do the request, being careful to tame the response body
+	start := time.Now()
 	resp, err := h.HealthChecks.Active.httpClient.Do(req) //nolint:gosec // no SSRF
+	reverseProxyMetrics.upstreamCheckDuration.With(prometheus.Labels{"upstream": upstream.Dial}).Observe(time.Since(start).Seconds())
 	if err != nil {
 		if c := h.HealthChecks.Active.logger.Check(zapcore.InfoLevel, "HTTP request failed"); c != nil {
 			c.Write(
@@ -514,7 +534,11 @@ func (h *Handler) doActiveHealthCheck(dialInfo DialInfo, hostAddr string, networ
 				zap.Error(err),
 			)
 		}
-		markUnhealthy()
+		reason := checkFailDialError
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			reason = checkFailTimeout
+		}
+		markUnhealthy(reason)
 		return nil
 	}
 	var body io.Reader = resp.Body
@@ -536,7 +560,7 @@ func (h *Handler) doActiveHealthCheck(dialInfo DialInfo, hostAddr string, networ
 					zap.String("host", hostAddr),
 				)
 			}
-			markUnhealthy()
+			markUnhealthy(checkFailBadStatus)
 			return nil
 		}
 	} else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -546,7 +570,7 @@ func (h *Handler) doActiveHealthCheck(dialInfo DialInfo, hostAddr string, networ
 				zap.String("host", hostAddr),
 			)
 		}
-		markUnhealthy()
+		markUnhealthy(checkFailBadStatus)
 		return nil
 	}
 
@@ -560,7 +584,7 @@ func (h *Handler) doActiveHealthCheck(dialInfo DialInfo, hostAddr string, networ
 					zap.Error(err),
 				)
 			}
-			markUnhealthy()
+			markUnhealthy(checkFailBodyRead)
 			return nil
 		}
 		if !h.HealthChecks.Active.bodyRegexp.Match(bodyBytes) {
@@ -569,7 +593,7 @@ func (h *Handler) doActiveHealthCheck(dialInfo DialInfo, hostAddr string, networ
 					zap.String("host", hostAddr),
 				)
 			}
-			markUnhealthy()
+			markUnhealthy(checkFailBadBody)
 			return nil
 		}
 	}

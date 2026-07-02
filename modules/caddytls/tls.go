@@ -999,6 +999,7 @@ func (t *TLS) storageCleanInterval() time.Duration {
 
 // onEvent translates CertMagic events into Caddy events then dispatches them.
 func (t *TLS) onEvent(ctx context.Context, eventName string, data map[string]any) error {
+	observeCertEvent(eventName, data)
 	evt := t.events.Emit(t.ctx, eventName, data)
 	return evt.Aborted
 }

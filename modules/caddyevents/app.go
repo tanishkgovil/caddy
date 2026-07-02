@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -120,6 +121,7 @@ func (App) CaddyModule() caddy.ModuleInfo {
 func (app *App) Provision(ctx caddy.Context) error {
 	app.logger = ctx.Logger()
 	app.subscriptions = make(map[string]map[caddy.ModuleID][]Handler)
+	initEventsMetrics(ctx.GetMetricsRegistry())
 
 	for _, sub := range app.Subscriptions {
 		if sub.HandlersRaw == nil {
@@ -225,6 +227,16 @@ func (app *App) Emit(ctx caddy.Context, eventName string, data map[string]any) c
 		zap.String("id", e.ID().String()),
 		zap.String("origin", originModuleName))
 
+	// if origin label is empty (core caddy), use "caddy"
+	originLabel := originModuleName
+	if originLabel == "" {
+		originLabel = "caddy"
+	}
+	eventsMetrics.emitted.WithLabelValues(e.Name(), originLabel).Inc()
+	defer func(start time.Time) {
+		eventsMetrics.dispatchDuration.WithLabelValues(e.Name(), originLabel).Observe(time.Since(start).Seconds())
+	}(time.Now())
+
 	// add event info to replacer, make sure it's in the context
 	repl, ok := ctx.Context.Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 	if !ok {
@@ -296,9 +308,11 @@ func (app *App) Emit(ctx caddy.Context, eventName string, data map[string]any) c
 						zap.Bool("aborted", aborted))
 
 					if aborted {
+						eventsMetrics.aborted.WithLabelValues(e.Name(), originLabel).Inc()
 						e.Aborted = err
 						return e
 					}
+					eventsMetrics.handlerErrors.WithLabelValues(e.Name(), originLabel).Inc()
 				}
 			}
 

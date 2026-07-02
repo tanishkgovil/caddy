@@ -26,6 +26,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 	"golang.org/x/net/http2"
 
@@ -203,14 +204,16 @@ func (app *App) Provision(ctx caddy.Context) error {
 	}
 
 	if app.Metrics != nil {
-		app.Metrics.init = sync.Once{}
-		app.Metrics.httpMetrics = &httpMetrics{}
+		app.Metrics.vecs = selectHTTPVecs(app.Metrics.PerHost)
+		initHTTPMetrics(ctx.GetMetricsRegistry(), app.Metrics.vecs)
+		initConnMetrics(ctx.GetMetricsRegistry(), connVecs)
 		// Scan config for allowed hosts to prevent cardinality explosion
 		app.Metrics.scanConfigForHosts(app)
 		if err := app.Metrics.provisionOTLP(ctx); err != nil {
 			return err
 		}
 	}
+
 	// prepare each server
 	oldContext := ctx.Context
 	for srvName, srv := range app.Servers {
@@ -223,11 +226,10 @@ func (app *App) Provision(ctx caddy.Context) error {
 		srv.errorLogger = app.logger.Named("log.error")
 		if srv.Metrics != nil {
 			srv.logger.Warn("per-server 'metrics' is deprecated; use 'metrics' in the root 'http' app instead")
-			app.Metrics = cmp.Or(app.Metrics, &Metrics{
-				init:        sync.Once{},
-				httpMetrics: &httpMetrics{},
-			})
+			app.Metrics = cmp.Or(app.Metrics, &Metrics{})
 			app.Metrics.PerHost = app.Metrics.PerHost || srv.Metrics.PerHost
+			app.Metrics.vecs = selectHTTPVecs(app.Metrics.PerHost)
+			initHTTPMetrics(ctx.GetMetricsRegistry(), app.Metrics.vecs)
 		}
 
 		// only enable access logs if configured
@@ -385,6 +387,12 @@ func (app *App) Provision(ctx caddy.Context) error {
 		}
 	}
 	ctx.Context = oldContext
+
+	// Register the config-derived HTTP request-family label tuples
+	// (server, handler[, host]) with the metrics tracker.
+	registerHTTPRequestMetrics(ctx.MetricsTracker(), app)
+	registerConnMetrics(ctx.MetricsTracker(), app)
+
 	return nil
 }
 
@@ -594,6 +602,11 @@ func (app *App) Start() error {
 						zap.Bool("tls", useTLS),
 						zap.Bool("http3", srv.h3server != nil))
 
+					// wrap the listener to count connections
+					if app.Metrics != nil {
+						ln = &metricsListener{Listener: ln, server: srvName, vecs: connVecs}
+					}
+
 					srv.listeners = append(srv.listeners, ln)
 
 					//nolint:errcheck
@@ -639,6 +652,10 @@ func (app *App) Start() error {
 		srv.logger.Info("server running",
 			zap.String("name", srvName),
 			zap.Strings("protocols", srv.Protocols))
+
+		if app.Metrics != nil {
+			connVecs.listeners.With(prometheus.Labels{"server": srvName}).Set(float64(len(srv.listeners)))
+		}
 	}
 
 	// finish automatic HTTPS by finally beginning

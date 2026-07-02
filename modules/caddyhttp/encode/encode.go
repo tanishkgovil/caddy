@@ -30,6 +30,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
@@ -126,8 +128,22 @@ func (enc *Encode) Provision(ctx caddy.Context) error {
 			},
 		}
 	}
+	initEncodeMetrics(ctx.GetMetricsRegistry())
+	enc.trackMetrics(ctx)
 
 	return nil
+}
+
+// trackMetrics registers the metrics for this module with the MetricsTracker
+func (enc *Encode) trackMetrics(ctx caddy.Context) {
+	srv, ok := ctx.Value(caddyhttp.ServerCtxKey).(*caddyhttp.Server)
+	if !ok {
+		return
+	}
+	labels := prometheus.Labels{"server": srv.Name()}
+	for _, vec := range encodeMetricVecs() {
+		ctx.MetricsTracker().RegisterMetric(vec, labels)
+	}
 }
 
 // Validate ensures that enc's configuration is valid.
@@ -158,7 +174,12 @@ func (enc *Encode) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 				continue // encoding not offered
 			}
 			w = enc.openResponseWriter(encName, w, r.Method == http.MethodConnect)
-			defer w.(*responseWriter).Close()
+			rw := w.(*responseWriter)
+			if srv, ok := r.Context().Value(caddyhttp.ServerCtxKey).(*caddyhttp.Server); ok {
+				rw.server = srv.Name()
+			}
+			rw.bypassedBytesMetric = encodeMetrics.bypassedBytes.With(prometheus.Labels{"server": rw.server})
+			defer rw.Close()
 
 			// to comply with RFC 9110 section 8.8.3(.3), we modify the Etag when encoding
 			// by appending a hyphen and the encoder name; the problem is, the client will
@@ -244,6 +265,12 @@ type responseWriter struct {
 	wroteHeader  bool
 	isConnect    bool
 	disabled     bool // disable encoding (for error responses)
+	server       string
+	// metrics
+	responsesMetric         prometheus.Counter
+	uncompressedBytesMetric prometheus.Counter
+	compressedBytesMetric   prometheus.Counter
+	bypassedBytesMetric     prometheus.Counter
 }
 
 // WriteHeader stores the status to write when the time comes
@@ -353,8 +380,10 @@ func (rw *responseWriter) Write(p []byte) (int, error) {
 	}
 
 	if rw.w != nil {
+		rw.uncompressedBytesMetric.Add(float64(len(p)))
 		return rw.w.Write(p)
 	} else {
+		rw.bypassedBytesMetric.Add(float64(len(p)))
 		return rw.ResponseWriter.Write(p)
 	}
 }
@@ -393,12 +422,14 @@ func (rw *responseWriter) ReadFrom(r io.Reader) (int64, error) {
 		}
 	}
 
-	// the response will be compressed, no sendfile support
+	// the response will be compressed so increment number of incoming raw uncompressed bytes.
 	if rw.w != nil {
 		nr, err := io.Copy(rw.w, r)
+		rw.uncompressedBytesMetric.Add(float64(nr))
 		return nr + ns, err
 	}
 	nr, err := rf.ReadFrom(r)
+	rw.bypassedBytesMetric.Add(float64(nr))
 	return nr + ns, err
 }
 
@@ -446,8 +477,13 @@ func (rw *responseWriter) init() {
 
 	if hdr.Get("Content-Encoding") == "" && isEncodeAllowed(hdr) &&
 		rw.config.Match(rw) {
+		encLabels := prometheus.Labels{"server": rw.server, "encoding": rw.encodingName}
+		rw.responsesMetric = encodeMetrics.responses.With(encLabels)
+		rw.uncompressedBytesMetric = encodeMetrics.uncompressedBytes.With(encLabels)
+		rw.compressedBytesMetric = encodeMetrics.compressedBytes.With(encLabels)
+		rw.responsesMetric.Inc()
 		rw.w = rw.config.writerPools[rw.encodingName].Get().(Encoder)
-		rw.w.Reset(rw.ResponseWriter)
+		rw.w.Reset(countingWriter{w: rw.ResponseWriter, c: rw.compressedBytesMetric})
 		hdr.Del("Content-Length") // https://github.com/golang/go/issues/14975
 		hdr.Set("Content-Encoding", rw.encodingName)
 		if !hasVaryValue(hdr, "Accept-Encoding") {

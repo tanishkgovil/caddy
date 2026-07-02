@@ -467,6 +467,11 @@ func run(newCfg *Config, start bool) (Context, error) {
 	globalMetrics.configSuccess.Set(1)
 	globalMetrics.configSuccessTime.SetToCurrentTime()
 
+	// Update metrics with the new config's values.
+	newSnap := ctx.metricsTracker.Snapshot()
+	prevSnap := swapSnapshot(newSnap)
+	pruneStaleLabels(prevSnap, newSnap)
+
 	// TODO: This event is experimental and subject to change.
 	ctx.emitEvent("started", nil)
 
@@ -553,6 +558,7 @@ func provisionContext(newCfg *Config, replaceAdminServer bool) (Context, error) 
 		if newCfg.storage == nil {
 			newCfg.storage = DefaultStorage
 		}
+		newCfg.storage = newMeteredStorage(newCfg.storage)
 		certmagic.Default.Storage = newCfg.storage
 
 		return nil

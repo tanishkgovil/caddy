@@ -4,13 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	otelprom "go.opentelemetry.io/contrib/bridges/prometheus"
 	"go.opentelemetry.io/contrib/exporters/autoexport"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -82,85 +82,226 @@ type Metrics struct {
 	// keep this field false to disable OTLP export.
 	OTLP bool `json:"otlp,omitempty"`
 
-	init           sync.Once
-	httpMetrics    *httpMetrics
 	allowedHosts   map[string]struct{}
 	hasHTTPSServer bool
 	meterProvider  *sdkmetric.MeterProvider
+	vecs           *httpMetricVecs
 }
 
-type httpMetrics struct {
+// httpMetricVecs holds the package-level metrics for the HTTP app.
+type httpMetricVecs struct {
 	requestInFlight  *prometheus.GaugeVec
-	requestCount     *prometheus.CounterVec
 	requestErrors    *prometheus.CounterVec
+	requestCount     *prometheus.CounterVec
 	requestDuration  *prometheus.HistogramVec
 	requestSize      *prometheus.HistogramVec
 	responseSize     *prometheus.HistogramVec
 	responseDuration *prometheus.HistogramVec
 }
 
-func initHTTPMetrics(ctx caddy.Context, metrics *Metrics) {
-	const ns, sub = "caddy", "http"
-	registry := ctx.GetMetricsRegistry()
-	basicLabels := []string{"server", "handler"}
-	if metrics.PerHost {
-		basicLabels = append(basicLabels, "host")
+// metricVecs returns all MetricVecs contained in this struct.
+func (v *httpMetricVecs) metricVecs() []caddy.MetricVec {
+	return []caddy.MetricVec{
+		v.requestInFlight.MetricVec,
+		v.requestErrors.MetricVec,
+		v.requestCount.MetricVec,
+		v.requestDuration.MetricVec,
+		v.requestSize.MetricVec,
+		v.responseSize.MetricVec,
+		v.responseDuration.MetricVec,
 	}
-	metrics.httpMetrics.requestInFlight = promauto.With(registry).NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: ns,
-		Subsystem: sub,
-		Name:      "requests_in_flight",
-		Help:      "Number of requests currently handled by this server.",
-	}, basicLabels)
-	metrics.httpMetrics.requestErrors = promauto.With(registry).NewCounterVec(prometheus.CounterOpts{
-		Namespace: ns,
-		Subsystem: sub,
-		Name:      "request_errors_total",
-		Help:      "Number of requests resulting in middleware errors.",
-	}, basicLabels)
-	metrics.httpMetrics.requestCount = promauto.With(registry).NewCounterVec(prometheus.CounterOpts{
-		Namespace: ns,
-		Subsystem: sub,
-		Name:      "requests_total",
-		Help:      "Counter of HTTP(S) requests made.",
-	}, basicLabels)
+}
 
-	// TODO: allow these to be customized in the config
-	durationBuckets := prometheus.DefBuckets
-	sizeBuckets := prometheus.ExponentialBuckets(256, 4, 8)
-
-	httpLabels := []string{"server", "handler", "code", "method"}
-	if metrics.PerHost {
-		httpLabels = append(httpLabels, "host")
+func newHTTPMetricVecs(perHost bool) *httpMetricVecs {
+	base := []string{"server", "handler"}
+	withCode := []string{"server", "handler", "code", "method"}
+	if perHost {
+		base = append(base, "host")
+		withCode = append(withCode, "host")
 	}
-	metrics.httpMetrics.requestDuration = promauto.With(registry).NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: ns,
-		Subsystem: sub,
-		Name:      "request_duration_seconds",
-		Help:      "Histogram of round-trip request durations.",
-		Buckets:   durationBuckets,
-	}, httpLabels)
-	metrics.httpMetrics.requestSize = promauto.With(registry).NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: ns,
-		Subsystem: sub,
-		Name:      "request_size_bytes",
-		Help:      "Total size of the request. Includes body",
-		Buckets:   sizeBuckets,
-	}, httpLabels)
-	metrics.httpMetrics.responseSize = promauto.With(registry).NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: ns,
-		Subsystem: sub,
-		Name:      "response_size_bytes",
-		Help:      "Size of the returned response.",
-		Buckets:   sizeBuckets,
-	}, httpLabels)
-	metrics.httpMetrics.responseDuration = promauto.With(registry).NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: ns,
-		Subsystem: sub,
-		Name:      "response_duration_seconds",
-		Help:      "Histogram of times to first byte in response bodies.",
-		Buckets:   durationBuckets,
-	}, httpLabels)
+	return &httpMetricVecs{
+		requestInFlight: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: "caddy", Subsystem: "http",
+			Name: "requests_in_flight",
+			Help: "Number of requests currently handled by this server.",
+		}, base),
+
+		requestErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "caddy", Subsystem: "http",
+			Name: "request_errors_total",
+			Help: "Number of requests resulting in middleware errors.",
+		}, base),
+
+		requestCount: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "caddy", Subsystem: "http",
+			Name: "requests_total",
+			Help: "Counter of HTTP(S) requests made.",
+		}, base),
+
+		requestDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: "caddy", Subsystem: "http",
+			Name:    "request_duration_seconds",
+			Help:    "Histogram of round-trip request durations.",
+			Buckets: prometheus.DefBuckets,
+		}, withCode),
+
+		requestSize: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: "caddy", Subsystem: "http",
+			Name:    "request_size_bytes",
+			Help:    "Total size of the request. Includes body.",
+			Buckets: prometheus.ExponentialBuckets(256, 4, 8),
+		}, withCode),
+
+		responseSize: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: "caddy", Subsystem: "http",
+			Name:    "response_size_bytes",
+			Help:    "Size of the returned response.",
+			Buckets: prometheus.ExponentialBuckets(256, 4, 8),
+		}, withCode),
+
+		responseDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: "caddy", Subsystem: "http",
+			Name:    "response_duration_seconds",
+			Help:    "Histogram of times to first byte in response bodies.",
+			Buckets: prometheus.DefBuckets,
+		}, withCode),
+	}
+}
+
+// currentHTTPVecs and currentHTTPPerHost hold current state of HTTP metric vecs
+var (
+	currentHTTPVecs    *httpMetricVecs
+	currentHTTPPerHost bool
+)
+
+// selectHTTPVecs returns current httpMetricVecs, creates new ones if perHost changed
+func selectHTTPVecs(perHost bool) *httpMetricVecs {
+	if currentHTTPVecs == nil || currentHTTPPerHost != perHost {
+		currentHTTPVecs = newHTTPMetricVecs(perHost)
+		currentHTTPPerHost = perHost
+	}
+	return currentHTTPVecs
+}
+
+// initHTTPMetrics registers the HTTP metrics vecs to the provided Prometheus registry.
+// Panics if registration fails for any reason other than already being registered.
+func initHTTPMetrics(registry *prometheus.Registry, vecs *httpMetricVecs) {
+	registerVecs(registry, vecs.metricVecs())
+}
+
+// registerVecs registers each vec on the registry
+func registerVecs(registry *prometheus.Registry, vecs []caddy.MetricVec) {
+	for _, vec := range vecs {
+		if err := registry.Register(vec); err != nil &&
+			!errors.Is(err, prometheus.AlreadyRegisteredError{
+				ExistingCollector: vec,
+				NewCollector:      vec,
+			}) {
+			panic(err)
+		}
+	}
+}
+
+// connMetricVecs holds the package-level metrics for connection tracking.
+type connMetricVecs struct {
+	connectionsTotal   *prometheus.CounterVec
+	currentConnections *prometheus.GaugeVec
+	receivedBytes      *prometheus.CounterVec
+	sentBytes          *prometheus.CounterVec
+	listeners          *prometheus.GaugeVec
+}
+
+func (v *connMetricVecs) metricVecs() []caddy.MetricVec {
+	return []caddy.MetricVec{
+		v.connectionsTotal.MetricVec,
+		v.currentConnections.MetricVec,
+		v.receivedBytes.MetricVec,
+		v.sentBytes.MetricVec,
+		v.listeners.MetricVec,
+	}
+}
+
+var connVecs = &connMetricVecs{
+	connectionsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "caddy", Subsystem: "http",
+		Name: "connections_total",
+		Help: "Number of connections accepted by this server.",
+	}, []string{"server"}),
+	currentConnections: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "caddy", Subsystem: "http",
+		Name: "current_connections",
+		Help: "Number of connections currently open on this server.",
+	}, []string{"server"}),
+	receivedBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "caddy", Subsystem: "http",
+		Name: "received_bytes_total",
+		Help: "Number of bytes received from clients on this server's connections.",
+	}, []string{"server"}),
+	sentBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "caddy", Subsystem: "http",
+		Name: "sent_bytes_total",
+		Help: "Number of bytes sent to clients on this server's connections.",
+	}, []string{"server"}),
+	listeners: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "caddy", Subsystem: "http",
+		Name: "listeners",
+		Help: "Number of bound network sockets for this server.",
+	}, []string{"server"}),
+}
+
+// initConnMetrics registers the connection metrics vecs to the provided Prometheus registry.
+func initConnMetrics(registry *prometheus.Registry, vecs *connMetricVecs) {
+	registerVecs(registry, vecs.metricVecs())
+}
+
+// metricsListener wraps a net.Listener to keep metrics updated with listener activity.
+type metricsListener struct {
+	net.Listener
+	server string
+	vecs   *connMetricVecs
+}
+
+func (l *metricsListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	labels := prometheus.Labels{"server": l.server}
+	l.vecs.connectionsTotal.With(labels).Inc()
+	cur := l.vecs.currentConnections.With(labels)
+	cur.Inc()
+	return &metricsConn{
+		Conn:     conn,
+		dec:      cur.Dec,
+		received: l.vecs.receivedBytes.With(labels),
+		sent:     l.vecs.sentBytes.With(labels),
+	}, nil
+}
+
+// metricsConn wraps a net.Conn to keep metrics updated with connection activity.
+type metricsConn struct {
+	net.Conn
+	once     sync.Once
+	dec      func()
+	received prometheus.Counter
+	sent     prometheus.Counter
+}
+
+func (c *metricsConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	c.received.Add(float64(n))
+	return n, err
+}
+
+func (c *metricsConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	c.sent.Add(float64(n))
+	return n, err
+}
+
+func (c *metricsConn) Close() error {
+	c.once.Do(c.dec)
+	return c.Conn.Close()
 }
 
 // provisionOTLP wires a MeterProvider that periodically reads the process-wide
@@ -303,11 +444,7 @@ type metricsInstrumentedRoute struct {
 	metrics *Metrics
 }
 
-func newMetricsInstrumentedRoute(ctx caddy.Context, handler string, next Handler, m *Metrics) *metricsInstrumentedRoute {
-	m.init.Do(func() {
-		initHTTPMetrics(ctx, m)
-	})
-
+func newMetricsInstrumentedRoute(_ caddy.Context, handler string, next Handler, m *Metrics) *metricsInstrumentedRoute {
 	return &metricsInstrumentedRoute{handler: handler, next: next, metrics: m}
 }
 
@@ -334,7 +471,8 @@ func (h *metricsInstrumentedRoute) ServeHTTP(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	inFlight := h.metrics.httpMetrics.requestInFlight.With(labels)
+	vecs := h.metrics.vecs
+	inFlight := vecs.requestInFlight.With(labels)
 	inFlight.Inc()
 	defer inFlight.Dec()
 
@@ -346,13 +484,13 @@ func (h *metricsInstrumentedRoute) ServeHTTP(w http.ResponseWriter, r *http.Requ
 	writeHeaderRecorder := ShouldBufferFunc(func(status int, header http.Header) bool {
 		statusLabels["code"] = caddymetrics.SanitizeCode(status)
 		ttfb := time.Since(start).Seconds()
-		h.metrics.httpMetrics.responseDuration.With(statusLabels).Observe(ttfb)
+		vecs.responseDuration.With(statusLabels).Observe(ttfb)
 		return false
 	})
 	wrec := NewResponseRecorder(w, nil, writeHeaderRecorder)
 	err := h.next.ServeHTTP(wrec, r)
 	dur := time.Since(start).Seconds()
-	h.metrics.httpMetrics.requestCount.With(labels).Inc()
+	vecs.requestCount.With(labels).Inc()
 
 	observeRequest := func(status int) {
 		// If the code hasn't been set yet, and we didn't encounter an error, we're
@@ -363,9 +501,9 @@ func (h *metricsInstrumentedRoute) ServeHTTP(w http.ResponseWriter, r *http.Requ
 			statusLabels["code"] = caddymetrics.SanitizeCode(status)
 		}
 
-		h.metrics.httpMetrics.requestDuration.With(statusLabels).Observe(dur)
-		h.metrics.httpMetrics.requestSize.With(statusLabels).Observe(float64(computeApproximateRequestSize(r)))
-		h.metrics.httpMetrics.responseSize.With(statusLabels).Observe(float64(wrec.Size()))
+		vecs.requestDuration.With(statusLabels).Observe(dur)
+		vecs.requestSize.With(statusLabels).Observe(float64(computeApproximateRequestSize(r)))
+		vecs.responseSize.With(statusLabels).Observe(float64(wrec.Size()))
 	}
 
 	if err != nil {
@@ -374,7 +512,7 @@ func (h *metricsInstrumentedRoute) ServeHTTP(w http.ResponseWriter, r *http.Requ
 			observeRequest(handlerErr.StatusCode)
 		}
 
-		h.metrics.httpMetrics.requestErrors.With(labels).Inc()
+		vecs.requestErrors.With(labels).Inc()
 
 		return err
 	}

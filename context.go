@@ -52,6 +52,7 @@ type Context struct {
 	cleanupFuncs    []func()                // invoked at every config unload
 	exitFuncs       []func(context.Context) // invoked at config unload ONLY IF the process is exiting (EXPERIMENTAL)
 	metricsRegistry *prometheus.Registry
+	metricsTracker  *MetricsTracker
 }
 
 // NewContext provides a new context derived from the given
@@ -70,7 +71,12 @@ func NewContext(ctx Context) (Context, context.CancelFunc) {
 // NewContextWithCause is like NewContext but returns a context.CancelCauseFunc.
 // EXPERIMENTAL: This API is subject to change.
 func NewContextWithCause(ctx Context) (Context, context.CancelCauseFunc) {
-	newCtx := Context{moduleInstances: make(map[string][]Module), cfg: ctx.cfg, metricsRegistry: prometheus.NewPedanticRegistry()}
+	newCtx := Context{
+		moduleInstances: make(map[string][]Module),
+		cfg:             ctx.cfg,
+		metricsRegistry: prometheus.NewPedanticRegistry(),
+		metricsTracker:  newMetricsTracker(),
+	}
 	c, cancel := context.WithCancelCause(ctx.Context)
 	wrappedCancel := func(cause error) {
 		cancel(cause)
@@ -116,6 +122,12 @@ func (ctx *Context) GetMetricsRegistry() *prometheus.Registry {
 	return ctx.metricsRegistry
 }
 
+// MetricsTracker returns the metrics tracker for this context, which
+// modules can use to declare which prometheus metrics they will emit.
+func (ctx *Context) MetricsTracker() *MetricsTracker {
+	return ctx.metricsTracker
+}
+
 func (ctx *Context) initMetrics() {
 	ctx.metricsRegistry.MustRegister(
 		collectors.NewBuildInfoCollector(),
@@ -125,6 +137,9 @@ func (ctx *Context) initMetrics() {
 		adminMetrics.requestErrors,
 		globalMetrics.configSuccess,
 		globalMetrics.configSuccessTime,
+		globalMetrics.droppedLogs,
+		storageMetrics.ops,
+		storageMetrics.opDuration,
 	)
 }
 

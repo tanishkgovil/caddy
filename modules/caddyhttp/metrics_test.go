@@ -4,16 +4,29 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/caddyserver/caddy/v2"
 )
+
+// resetHTTPVecs resets all metrics in vecs to their initial state.
+func resetHTTPVecs(vecs *httpMetricVecs) {
+	vecs.requestInFlight.Reset()
+	vecs.requestErrors.Reset()
+	vecs.requestCount.Reset()
+	vecs.requestDuration.Reset()
+	vecs.requestSize.Reset()
+	vecs.responseSize.Reset()
+	vecs.responseDuration.Reset()
+}
 
 func TestServerNameFromContext(t *testing.T) {
 	ctx := context.Background()
@@ -30,15 +43,15 @@ func TestServerNameFromContext(t *testing.T) {
 }
 
 func TestMetricsInstrumentedHandler(t *testing.T) {
+	vecs := newHTTPMetricVecs(false)
+	resetHTTPVecs(vecs)
 	ctx, _ := caddy.NewContext(caddy.Context{Context: context.Background()})
-	metrics := &Metrics{
-		init:        sync.Once{},
-		httpMetrics: &httpMetrics{},
-	}
+	initHTTPMetrics(ctx.GetMetricsRegistry(), vecs)
+	metrics := &Metrics{vecs: vecs}
 	handlerErr := errors.New("oh noes")
 	response := []byte("hello world!")
 	h := HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
-		if actual := testutil.ToFloat64(metrics.httpMetrics.requestInFlight); actual != 1.0 {
+		if actual := testutil.ToFloat64(vecs.requestInFlight); actual != 1.0 {
 			t.Errorf("Not same: expected %#v, but got %#v", 1.0, actual)
 		}
 		if handlerErr == nil {
@@ -55,7 +68,7 @@ func TestMetricsInstrumentedHandler(t *testing.T) {
 	if actual := ih.ServeHTTP(w, r); actual != handlerErr {
 		t.Errorf("Not same: expected %#v, but got %#v", handlerErr, actual)
 	}
-	if actual := testutil.ToFloat64(metrics.httpMetrics.requestInFlight); actual != 0.0 {
+	if actual := testutil.ToFloat64(vecs.requestInFlight); actual != 0.0 {
 		t.Errorf("Not same: expected %#v, but got %#v", 0.0, actual)
 	}
 
@@ -112,7 +125,7 @@ func TestMetricsInstrumentedHandler(t *testing.T) {
 	caddy_http_request_duration_seconds_bucket{code="429",handler="foo",method="GET",server="UNKNOWN",le="10"} 1
 	caddy_http_request_duration_seconds_bucket{code="429",handler="foo",method="GET",server="UNKNOWN",le="+Inf"} 1
 	caddy_http_request_duration_seconds_count{code="429",handler="foo",method="GET",server="UNKNOWN"} 1
-	# HELP caddy_http_request_size_bytes Total size of the request. Includes body
+	# HELP caddy_http_request_size_bytes Total size of the request. Includes body.
 	# TYPE caddy_http_request_size_bytes histogram
 	caddy_http_request_size_bytes_bucket{code="200",handler="bar",method="GET",server="UNKNOWN",le="256"} 1
     caddy_http_request_size_bytes_bucket{code="200",handler="bar",method="GET",server="UNKNOWN",le="1024"} 1
@@ -201,18 +214,20 @@ func TestMetricsInstrumentedHandler(t *testing.T) {
 }
 
 func TestMetricsInstrumentedHandlerPerHost(t *testing.T) {
+	vecs := newHTTPMetricVecs(true)
+	resetHTTPVecs(vecs)
 	ctx, _ := caddy.NewContext(caddy.Context{Context: context.Background()})
+	initHTTPMetrics(ctx.GetMetricsRegistry(), vecs)
 	metrics := &Metrics{
 		PerHost:              true,
 		ObserveCatchallHosts: true, // Allow all hosts for testing
-		init:                 sync.Once{},
-		httpMetrics:          &httpMetrics{},
 		allowedHosts:         make(map[string]struct{}),
+		vecs:                 vecs,
 	}
 	handlerErr := errors.New("oh noes")
 	response := []byte("hello world!")
 	h := HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
-		if actual := testutil.ToFloat64(metrics.httpMetrics.requestInFlight); actual != 1.0 {
+		if actual := testutil.ToFloat64(vecs.requestInFlight); actual != 1.0 {
 			t.Errorf("Not same: expected %#v, but got %#v", 1.0, actual)
 		}
 		if handlerErr == nil {
@@ -229,7 +244,7 @@ func TestMetricsInstrumentedHandlerPerHost(t *testing.T) {
 	if actual := ih.ServeHTTP(w, r); actual != handlerErr {
 		t.Errorf("Not same: expected %#v, but got %#v", handlerErr, actual)
 	}
-	if actual := testutil.ToFloat64(metrics.httpMetrics.requestInFlight); actual != 0.0 {
+	if actual := testutil.ToFloat64(vecs.requestInFlight); actual != 0.0 {
 		t.Errorf("Not same: expected %#v, but got %#v", 0.0, actual)
 	}
 
@@ -286,7 +301,7 @@ func TestMetricsInstrumentedHandlerPerHost(t *testing.T) {
 	caddy_http_request_duration_seconds_bucket{code="429",handler="foo",host="example.com",method="GET",server="UNKNOWN",le="10"} 1
 	caddy_http_request_duration_seconds_bucket{code="429",handler="foo",host="example.com",method="GET",server="UNKNOWN",le="+Inf"} 1
 	caddy_http_request_duration_seconds_count{code="429",handler="foo",host="example.com",method="GET",server="UNKNOWN"} 1
-	# HELP caddy_http_request_size_bytes Total size of the request. Includes body
+	# HELP caddy_http_request_size_bytes Total size of the request. Includes body.
 	# TYPE caddy_http_request_size_bytes histogram
 	caddy_http_request_size_bytes_bucket{code="200",handler="bar",host="example.com",method="GET",server="UNKNOWN",le="256"} 1
     caddy_http_request_size_bytes_bucket{code="200",handler="bar",host="example.com",method="GET",server="UNKNOWN",le="1024"} 1
@@ -375,15 +390,17 @@ func TestMetricsInstrumentedHandlerPerHost(t *testing.T) {
 }
 
 func TestMetricsCardinalityProtection(t *testing.T) {
+	vecs := newHTTPMetricVecs(true)
+	resetHTTPVecs(vecs)
 	ctx, _ := caddy.NewContext(caddy.Context{Context: context.Background()})
+	initHTTPMetrics(ctx.GetMetricsRegistry(), vecs)
 
 	// Test 1: Without AllowCatchAllHosts, arbitrary hosts should be mapped to "_other"
 	metrics := &Metrics{
 		PerHost:              true,
 		ObserveCatchallHosts: false, // Default - should map unknown hosts to "_other"
-		init:                 sync.Once{},
-		httpMetrics:          &httpMetrics{},
 		allowedHosts:         make(map[string]struct{}),
+		vecs:                 vecs,
 	}
 
 	// Add one allowed host
@@ -432,16 +449,18 @@ func TestMetricsCardinalityProtection(t *testing.T) {
 }
 
 func TestMetricsHTTPSCatchAll(t *testing.T) {
+	vecs := newHTTPMetricVecs(true)
+	resetHTTPVecs(vecs)
 	ctx, _ := caddy.NewContext(caddy.Context{Context: context.Background()})
+	initHTTPMetrics(ctx.GetMetricsRegistry(), vecs)
 
 	// Test that HTTPS requests allow catch-all even when AllowCatchAllHosts is false
 	metrics := &Metrics{
 		PerHost:              true,
 		ObserveCatchallHosts: false,
 		hasHTTPSServer:       true, // Simulate having HTTPS servers
-		init:                 sync.Once{},
-		httpMetrics:          &httpMetrics{},
 		allowedHosts:         make(map[string]struct{}), // Empty - no explicitly allowed hosts
+		vecs:                 vecs,
 	}
 
 	h := HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
@@ -481,16 +500,16 @@ func TestMetricsHTTPSCatchAll(t *testing.T) {
 }
 
 func TestMetricsInstrumentedRoute(t *testing.T) {
+	vecs := newHTTPMetricVecs(false)
+	resetHTTPVecs(vecs)
 	ctx, _ := caddy.NewContext(caddy.Context{Context: context.Background()})
-	m := &Metrics{
-		init:        sync.Once{},
-		httpMetrics: &httpMetrics{},
-	}
+	initHTTPMetrics(ctx.GetMetricsRegistry(), vecs)
+	m := &Metrics{vecs: vecs}
 
 	handlerErr := errors.New("oh noes")
 	response := []byte("hello world!")
 	innerHandler := HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
-		if actual := testutil.ToFloat64(m.httpMetrics.requestInFlight); actual != 1.0 {
+		if actual := testutil.ToFloat64(vecs.requestInFlight); actual != 1.0 {
 			t.Errorf("Expected requestInFlight to be 1.0, got %v", actual)
 		}
 		if handlerErr == nil {
@@ -508,10 +527,10 @@ func TestMetricsInstrumentedRoute(t *testing.T) {
 	if actual := ih.ServeHTTP(w, r); actual != handlerErr {
 		t.Errorf("Expected error %v, got %v", handlerErr, actual)
 	}
-	if actual := testutil.ToFloat64(m.httpMetrics.requestInFlight); actual != 0.0 {
+	if actual := testutil.ToFloat64(vecs.requestInFlight); actual != 0.0 {
 		t.Errorf("Expected requestInFlight to be 0.0 after request, got %v", actual)
 	}
-	if actual := testutil.ToFloat64(m.httpMetrics.requestErrors); actual != 1.0 {
+	if actual := testutil.ToFloat64(vecs.requestErrors); actual != 1.0 {
 		t.Errorf("Expected requestErrors to be 1.0, got %v", actual)
 	}
 
@@ -520,6 +539,36 @@ func TestMetricsInstrumentedRoute(t *testing.T) {
 	w = httptest.NewRecorder()
 	if err := ih.ServeHTTP(w, r); err != nil {
 		t.Errorf("Unexpected error: %v", err)
+	}
+}
+
+func TestPerHostFalseScrapeHasNoHostLabel(t *testing.T) {
+	vecs := newHTTPMetricVecs(false)
+	resetHTTPVecs(vecs)
+	ctx, _ := caddy.NewContext(caddy.Context{Context: context.Background()})
+	initHTTPMetrics(ctx.GetMetricsRegistry(), vecs)
+
+	m := &Metrics{vecs: vecs}
+	h := HandlerFunc(func(w http.ResponseWriter, r *http.Request) error { return nil })
+	ih := newMetricsInstrumentedRoute(ctx, "handler", h, m)
+
+	r := httptest.NewRequest("GET", "/", nil)
+	r.Host = "example.com"
+	w := httptest.NewRecorder()
+	ih.ServeHTTP(w, r)
+
+	mfs, err := ctx.GetMetricsRegistry().Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	for _, mf := range mfs {
+		for _, m := range mf.GetMetric() {
+			for _, lp := range m.GetLabel() {
+				if lp.GetName() == "host" {
+					t.Errorf("unexpected host label in metric family %s: host=%s", mf.GetName(), lp.GetValue())
+				}
+			}
+		}
 	}
 }
 
@@ -574,11 +623,11 @@ func TestMetricsShutdownNilReceiver(t *testing.T) {
 }
 
 func BenchmarkMetricsInstrumentedRoute(b *testing.B) {
+	vecs := newHTTPMetricVecs(false)
+	resetHTTPVecs(vecs)
 	ctx, _ := caddy.NewContext(caddy.Context{Context: context.Background()})
-	m := &Metrics{
-		init:        sync.Once{},
-		httpMetrics: &httpMetrics{},
-	}
+	initHTTPMetrics(ctx.GetMetricsRegistry(), vecs)
+	m := &Metrics{vecs: vecs}
 
 	noopHandler := HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
 		w.Write([]byte("ok"))
@@ -600,11 +649,11 @@ func BenchmarkMetricsInstrumentedRoute(b *testing.B) {
 // BenchmarkSingleRouteMetrics simulates the new behavior where metrics
 // are collected once for the entire route.
 func BenchmarkSingleRouteMetrics(b *testing.B) {
+	vecs := newHTTPMetricVecs(false)
+	resetHTTPVecs(vecs)
 	ctx, _ := caddy.NewContext(caddy.Context{Context: context.Background()})
-	m := &Metrics{
-		init:        sync.Once{},
-		httpMetrics: &httpMetrics{},
-	}
+	initHTTPMetrics(ctx.GetMetricsRegistry(), vecs)
+	m := &Metrics{vecs: vecs}
 
 	// Build a chain of 5 plain middleware handlers (no per-handler metrics)
 	var next Handler = HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
@@ -627,5 +676,65 @@ func BenchmarkSingleRouteMetrics(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		ih.ServeHTTP(w, r)
+	}
+}
+
+// oneShotListener returns single connection and always returns EOF after that
+type oneShotListener struct {
+	net.Listener
+	conn net.Conn
+}
+
+func (l *oneShotListener) Accept() (net.Conn, error) {
+	if l.conn == nil {
+		return nil, io.EOF
+	}
+	c := l.conn
+	l.conn = nil
+	return c, nil
+}
+
+// TestConnMetrics verifies that the connection metrics are properly
+// updated when a connection is accepted, read, written, and closed.
+func TestConnMetrics(t *testing.T) {
+	const server = "conn_metrics_test_srv"
+	vecs := connVecs
+	labels := prometheus.Labels{"server": server}
+
+	srvConn, cliConn := net.Pipe()
+	ml := &metricsListener{Listener: &oneShotListener{conn: srvConn}, server: server, vecs: vecs}
+
+	conn, err := ml.Accept()
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+
+	request := []byte("ping")
+	response := []byte("pong!!")
+	go func() {
+		cliConn.Write(request)
+		io.ReadFull(cliConn, make([]byte, len(response)))
+		cliConn.Close()
+	}()
+
+	if _, err := io.ReadFull(conn, make([]byte, len(request))); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if _, err := conn.Write(response); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	conn.Close()
+
+	if got := testutil.ToFloat64(vecs.connectionsTotal.With(labels)); got != 1 {
+		t.Errorf("connections_total: got %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(vecs.currentConnections.With(labels)); got != 0 {
+		t.Errorf("current_connections after close: got %v, want 0", got)
+	}
+	if got := testutil.ToFloat64(vecs.receivedBytes.With(labels)); got != float64(len(request)) {
+		t.Errorf("received_bytes: got %v, want %d", got, len(request))
+	}
+	if got := testutil.ToFloat64(vecs.sentBytes.With(labels)); got != float64(len(response)) {
+		t.Errorf("sent_bytes: got %v, want %d", got, len(response))
 	}
 }

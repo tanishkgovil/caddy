@@ -320,6 +320,18 @@ func (h Handler) copyResponse(dst http.ResponseWriter, src io.Reader, flushInter
 	return err
 }
 
+// readError marks errors encountered while reading from upstream (server abort).
+type readError struct{ err error }
+
+func (e readError) Error() string { return "reading: " + e.err.Error() }
+func (e readError) Unwrap() error { return e.err }
+
+// writeError marks errors encountered while writing to downstream (client abort).
+type writeError struct{ err error }
+
+func (e writeError) Error() string { return "writing: " + e.err.Error() }
+func (e writeError) Unwrap() error { return e.err }
+
 // copyBuffer returns any write errors or non-EOF read errors, and the amount
 // of bytes written.
 func (h Handler) copyBuffer(dst io.Writer, src io.Reader, buf []byte, logger *zap.Logger) (int64, error) {
@@ -360,7 +372,7 @@ func (h Handler) copyBuffer(dst io.Writer, src io.Reader, buf []byte, logger *za
 				)
 			}
 			if werr != nil {
-				return written, fmt.Errorf("writing: %w", werr)
+				return written, writeError{werr}
 			}
 			if nr != nw {
 				return written, io.ErrShortWrite
@@ -370,7 +382,7 @@ func (h Handler) copyBuffer(dst io.Writer, src io.Reader, buf []byte, logger *za
 			if rerr == io.EOF {
 				return written, nil
 			}
-			return written, fmt.Errorf("reading: %w", rerr)
+			return written, readError{rerr}
 		}
 	}
 }

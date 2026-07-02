@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
@@ -115,6 +116,7 @@ func (su *SRVUpstreams) Provision(ctx caddy.Context) error {
 	if su.resolver == nil {
 		su.resolver = net.DefaultResolver
 	}
+	ctx.MetricsTracker().RegisterMetric(reverseProxyMetrics.dnsResolutionDuration, prometheus.Labels{"source": su.String()})
 
 	return nil
 }
@@ -162,7 +164,16 @@ func (su SRVUpstreams) GetUpstreams(r *http.Request) ([]*Upstream, error) {
 		)
 	}
 
+	dnsStart := time.Now()
 	_, records, err := su.resolver.LookupSRV(r.Context(), service, proto, name)
+	// ignore warnings sent even when lookup succeeded
+	status := "success"
+	if err != nil && len(records) == 0 {
+		status = dnsStatus(err)
+	}
+	reverseProxyMetrics.dnsResolutionDuration.
+		With(prometheus.Labels{"source": su.String(), "status": status}).
+		Observe(time.Since(dnsStart).Seconds())
 	if err != nil {
 		// From LookupSRV docs: "If the response contains invalid names, those records are filtered
 		// out and an error will be returned alongside the remaining results, if any." Thus, we
@@ -350,6 +361,7 @@ func (au *AUpstreams) Provision(ctx caddy.Context) error {
 	if au.resolver == nil {
 		au.resolver = net.DefaultResolver
 	}
+	ctx.MetricsTracker().RegisterMetric(reverseProxyMetrics.dnsResolutionDuration, prometheus.Labels{"source": au.String()})
 
 	return nil
 }
@@ -400,7 +412,11 @@ func (au AUpstreams) GetUpstreams(r *http.Request) ([]*Upstream, error) {
 		)
 	}
 
+	dnsStart := time.Now()
 	ips, err := au.resolver.LookupIP(r.Context(), ipVersion, name)
+	reverseProxyMetrics.dnsResolutionDuration.
+		With(prometheus.Labels{"source": au.String(), "status": dnsStatus(err)}).
+		Observe(time.Since(dnsStart).Seconds())
 	if err != nil {
 		return nil, err
 	}

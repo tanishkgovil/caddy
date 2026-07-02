@@ -31,6 +31,22 @@ func init() {
 		Name: "caddy_config_last_reload_success_timestamp_seconds",
 		Help: "Timestamp of the last successful configuration reload.",
 	})
+	globalMetrics.droppedLogs = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "caddy_logs_dropped_total",
+		Help: "Counter of log entries dropped by sampling.",
+	})
+	storageMetrics.ops = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "caddy",
+		Subsystem: "storage",
+		Name:      "operations_total",
+		Help:      "Counter of storage operations, by operation and result.",
+	}, []string{"operation", "result"})
+	storageMetrics.opDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "caddy",
+		Subsystem: "storage",
+		Name:      "operation_duration_seconds",
+		Help:      "Duration of storage operations, by operation and result.",
+	}, []string{"operation", "result"})
 }
 
 // adminMetrics is a collection of metrics that can be tracked for the admin API.
@@ -43,6 +59,13 @@ var adminMetrics = struct {
 var globalMetrics = struct {
 	configSuccess     prometheus.Gauge
 	configSuccessTime prometheus.Gauge
+	droppedLogs       prometheus.Counter
+}{}
+
+// storageMetrics is a collection of metrics for the global storage backend.
+var storageMetrics = struct {
+	ops        *prometheus.CounterVec
+	opDuration *prometheus.HistogramVec
 }{}
 
 // Similar to promhttp.InstrumentHandlerCounter, but upper-cases method names

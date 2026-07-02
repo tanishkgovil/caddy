@@ -14,6 +14,9 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
@@ -236,6 +239,10 @@ func TestDialErrorBodyRetry(t *testing.T) {
 			req = prepareTestRequest(req)
 
 			rec := httptest.NewRecorder()
+			goodLabels := prometheus.Labels{"upstream": goodServer.Listener.Addr().String()}
+			sentBefore := testutil.ToFloat64(reverseProxyMetrics.upstreamSentBytes.With(goodLabels))
+			recvBefore := testutil.ToFloat64(reverseProxyMetrics.upstreamReceivedBytes.With(goodLabels))
+			redispatchBefore := testutil.ToFloat64(reverseProxyMetrics.upstreamRedispatches.With(goodLabels))
 			err := h.ServeHTTP(rec, req, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
 				return nil
 			}))
@@ -254,6 +261,30 @@ func TestDialErrorBodyRetry(t *testing.T) {
 			}
 			if tc.wantBody != "" && rec.Body.String() != tc.wantBody {
 				t.Errorf("body: got %q, want %q", rec.Body.String(), tc.wantBody)
+			}
+
+			// after a retry, both metrics should be incremented.
+			if tc.retries > 0 {
+				deadLabels := prometheus.Labels{"upstream": dead}
+				if got := testutil.ToFloat64(reverseProxyMetrics.upstreamResponseErrors.With(deadLabels)); got != 1 {
+					t.Errorf("response_errors_total for dead upstream: got %v, want 1", got)
+				}
+				if got := testutil.ToFloat64(reverseProxyMetrics.upstreamRetries.With(deadLabels)); got != 1 {
+					t.Errorf("retries_total for dead upstream: got %v, want 1", got)
+				}
+				if got := testutil.ToFloat64(reverseProxyMetrics.upstreamRedispatches.With(goodLabels)) - redispatchBefore; got != 1 {
+					t.Errorf("redispatch_warnings_total delta for good upstream: got %v, want 1", got)
+				}
+			}
+
+			// after a successful retry, the sent and received bytes should update.
+			if tc.body != "" && tc.wantStatus == http.StatusOK {
+				if got := testutil.ToFloat64(reverseProxyMetrics.upstreamSentBytes.With(goodLabels)) - sentBefore; got != float64(len(tc.body)) {
+					t.Errorf("sent_bytes delta: got %v, want %d", got, len(tc.body))
+				}
+				if got := testutil.ToFloat64(reverseProxyMetrics.upstreamReceivedBytes.With(goodLabels)) - recvBefore; got != float64(len(tc.body)) {
+					t.Errorf("received_bytes delta: got %v, want %d", got, len(tc.body))
+				}
 			}
 		})
 	}
