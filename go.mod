@@ -4,7 +4,7 @@ go 1.25.0
 
 replace github.com/caddyserver/caddy/v2 => ./
 
-replace github.com/caddyserver/certmagic => ../certmagic-0.25.3/
+replace github.com/caddyserver/certmagic => github.com/tanishkgovil/certmagic v0.25.3-hrt1
 
 require (
 	github.com/BurntSushi/toml v1.6.0
