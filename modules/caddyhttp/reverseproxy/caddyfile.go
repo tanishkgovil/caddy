@@ -863,6 +863,21 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 			h.VerboseLogs = true
 
+		case "metrics":
+			if h.MetricLabels == nil {
+				h.MetricLabels = make(map[string]string)
+			}
+			for nesting := d.Nesting(); d.NextBlock(nesting); {
+				if d.Val() != "label" {
+					return d.Errf("unrecognized metrics option %s", d.Val())
+				}
+				var name, value string
+				if !d.AllArgs(&name, &value) {
+					return d.ArgErr()
+				}
+				h.MetricLabels[name] = value
+			}
+
 		default:
 			return d.Errf("unrecognized subdirective %s", d.Val())
 		}

@@ -116,7 +116,7 @@ func (su *SRVUpstreams) Provision(ctx caddy.Context) error {
 	if su.resolver == nil {
 		su.resolver = net.DefaultResolver
 	}
-	ctx.MetricsTracker().RegisterMetric(reverseProxyMetrics.dnsResolutionDuration, prometheus.Labels{"source": su.String()})
+	ctx.MetricsTracker().RegisterMetric(dnsResolutionDuration, prometheus.Labels{"source": su.String()})
 
 	return nil
 }
@@ -171,7 +171,7 @@ func (su SRVUpstreams) GetUpstreams(r *http.Request) ([]*Upstream, error) {
 	if err != nil && len(records) == 0 {
 		status = dnsStatus(err)
 	}
-	reverseProxyMetrics.dnsResolutionDuration.
+	dnsResolutionDuration.
 		With(prometheus.Labels{"source": su.String(), "status": status}).
 		Observe(time.Since(dnsStart).Seconds())
 	if err != nil {
@@ -361,7 +361,7 @@ func (au *AUpstreams) Provision(ctx caddy.Context) error {
 	if au.resolver == nil {
 		au.resolver = net.DefaultResolver
 	}
-	ctx.MetricsTracker().RegisterMetric(reverseProxyMetrics.dnsResolutionDuration, prometheus.Labels{"source": au.String()})
+	ctx.MetricsTracker().RegisterMetric(dnsResolutionDuration, prometheus.Labels{"source": au.String()})
 
 	return nil
 }
@@ -414,7 +414,7 @@ func (au AUpstreams) GetUpstreams(r *http.Request) ([]*Upstream, error) {
 
 	dnsStart := time.Now()
 	ips, err := au.resolver.LookupIP(r.Context(), ipVersion, name)
-	reverseProxyMetrics.dnsResolutionDuration.
+	dnsResolutionDuration.
 		With(prometheus.Labels{"source": au.String(), "status": dnsStatus(err)}).
 		Observe(time.Since(dnsStart).Seconds())
 	if err != nil {

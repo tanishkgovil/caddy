@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -387,6 +388,7 @@ func (app *App) Provision(ctx caddy.Context) error {
 		}
 	}
 	ctx.Context = oldContext
+	provisionCustomMetricLabels(app, ctx)
 
 	// Register the config-derived HTTP request-family label tuples
 	// (server, handler[, host]) with the metrics tracker.
@@ -394,6 +396,41 @@ func (app *App) Provision(ctx caddy.Context) error {
 	registerConnMetrics(ctx.MetricsTracker(), app)
 
 	return nil
+}
+
+// provisionCustomMetricLabels collects all the custom metric label keys from
+// all handlers, and registers each with the union of all keys.
+func provisionCustomMetricLabels(app *App, ctx caddy.Context) {
+	var labelers []caddy.CustomMetricLabeler
+	collect := func(routes RouteList) {
+		for _, route := range routes {
+			for _, h := range route.Handlers {
+				if l, ok := h.(caddy.CustomMetricLabeler); ok {
+					labelers = append(labelers, l)
+				}
+			}
+		}
+	}
+	for _, srv := range app.Servers {
+		collect(srv.Routes)
+		for _, route := range srv.NamedRoutes {
+			collect(RouteList{*route})
+		}
+	}
+	if len(labelers) == 0 {
+		return
+	}
+
+	var union []string
+	for _, l := range labelers {
+		union = append(union, l.MetricLabelKeys()...)
+	}
+	slices.Sort(union)
+	union = slices.Compact(union)
+
+	for _, l := range labelers {
+		l.RegisterMetrics(union, ctx)
+	}
 }
 
 // Validate ensures the app's configuration is valid.

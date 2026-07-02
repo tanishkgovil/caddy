@@ -55,28 +55,28 @@ func TestUpstreamRoundTripMetrics(t *testing.T) {
 	labels := prometheus.Labels{"upstream": dial}
 	successLabels := prometheus.Labels{"upstream": dial, "status": "success"}
 
-	if got := histogramSampleCount(t, reverseProxyMetrics.upstreamConnectDuration, successLabels); got != 1 {
+	if got := histogramSampleCount(t, currentVecs().upstreamConnectDuration, successLabels); got != 1 {
 		t.Errorf("connect duration samples: got %d, want 1", got)
 	}
-	if got := histogramSampleCount(t, reverseProxyMetrics.upstreamResponseDuration, labels); got != 1 {
+	if got := histogramSampleCount(t, currentVecs().upstreamResponseDuration, labels); got != 1 {
 		t.Errorf("response duration samples: got %d, want 1", got)
 	}
-	if got := histogramSampleCount(t, reverseProxyMetrics.upstreamDuration, successLabels); got != 1 {
+	if got := histogramSampleCount(t, currentVecs().upstreamDuration, successLabels); got != 1 {
 		t.Errorf("total duration samples: got %d, want 1", got)
 	}
-	if got := testutil.ToFloat64(reverseProxyMetrics.upstreamConnAttempts.With(labels)); got != 1 {
+	if got := testutil.ToFloat64(currentVecs().upstreamConnAttempts.With(labels)); got != 1 {
 		t.Errorf("connection attempts: got %v, want 1", got)
 	}
-	if got := testutil.ToFloat64(reverseProxyMetrics.upstreamRequestsTotal.With(labels)); got != 1 {
+	if got := testutil.ToFloat64(currentVecs().upstreamRequestsTotal.With(labels)); got != 1 {
 		t.Errorf("requests total: got %v, want 1", got)
 	}
-	if got := testutil.ToFloat64(reverseProxyMetrics.upstreamRequestsInFlight.With(labels)); got != 0 {
+	if got := testutil.ToFloat64(currentVecs().upstreamRequestsInFlight.With(labels)); got != 0 {
 		t.Errorf("requests in flight after completion: got %v, want 0", got)
 	}
-	if got := testutil.ToFloat64(reverseProxyMetrics.upstreamResponsesTotal.With(prometheus.Labels{"upstream": dial, "code": "200"})); got != 1 {
+	if got := testutil.ToFloat64(currentVecs().upstreamResponsesTotal.With(prometheus.Labels{"upstream": dial, "code": "200"})); got != 1 {
 		t.Errorf("responses total: got %v, want 1", got)
 	}
-	if got := testutil.ToFloat64(reverseProxyMetrics.upstreamLastSession.With(labels)); got <= 0 {
+	if got := testutil.ToFloat64(currentVecs().upstreamLastSession.With(labels)); got <= 0 {
 		t.Errorf("last session timestamp: got %v, want > 0", got)
 	}
 }
@@ -107,7 +107,7 @@ func TestUpstreamServerAbortMetric(t *testing.T) {
 		_ = h.ServeHTTP(rec, req, caddyhttp.HandlerFunc(func(http.ResponseWriter, *http.Request) error { return nil }))
 	}()
 
-	if got := testutil.ToFloat64(reverseProxyMetrics.upstreamServerAborts.With(labels)); got != 1 {
+	if got := testutil.ToFloat64(currentVecs().upstreamServerAborts.With(labels)); got != 1 {
 		t.Errorf("server_aborts_total: got %v, want 1", got)
 	}
 }
@@ -141,22 +141,22 @@ func TestUpstreamConnectionMetrics(t *testing.T) {
 
 	// Create new connection
 	doRequest()
-	if got := testutil.ToFloat64(reverseProxyMetrics.upstreamConnAttempts.With(labels)); got != 1 {
+	if got := testutil.ToFloat64(currentVecs().upstreamConnAttempts.With(labels)); got != 1 {
 		t.Errorf("connection attempts after first request: got %v, want 1", got)
 	}
-	if got := testutil.ToFloat64(reverseProxyMetrics.upstreamConnErrors.With(labels)); got != 0 {
+	if got := testutil.ToFloat64(currentVecs().upstreamConnErrors.With(labels)); got != 0 {
 		t.Errorf("connection errors: got %v, want 0", got)
 	}
-	if got := testutil.ToFloat64(reverseProxyMetrics.upstreamConnReuses.With(labels)); got != 0 {
+	if got := testutil.ToFloat64(currentVecs().upstreamConnReuses.With(labels)); got != 0 {
 		t.Errorf("connection reuses after first request: got %v, want 0", got)
 	}
 
 	// Reuse existing connection
 	doRequest()
-	if got := testutil.ToFloat64(reverseProxyMetrics.upstreamConnAttempts.With(labels)); got != 1 {
+	if got := testutil.ToFloat64(currentVecs().upstreamConnAttempts.With(labels)); got != 1 {
 		t.Errorf("connection attempts after second request: got %v, want 1", got)
 	}
-	if got := testutil.ToFloat64(reverseProxyMetrics.upstreamConnReuses.With(labels)); got != 1 {
+	if got := testutil.ToFloat64(currentVecs().upstreamConnReuses.With(labels)); got != 1 {
 		t.Errorf("connection reuses after second request: got %v, want 1", got)
 	}
 }

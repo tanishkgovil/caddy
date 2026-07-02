@@ -225,6 +225,9 @@ type Handler struct {
 	// EXPERIMENTAL: This feature is subject to change or removal.
 	VerboseLogs bool `json:"verbose_logs,omitempty"`
 
+	// Custom labels to attach to this handler's upstream metrics.
+	MetricLabels map[string]string `json:"metric_labels,omitempty"`
+
 	Transport        http.RoundTripper `json:"-"`
 	CB               CircuitBreaker    `json:"-"`
 	DynamicUpstreams UpstreamSource    `json:"-"`
@@ -404,10 +407,6 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	// set up upstreams
 	for _, u := range h.Upstreams {
 		h.provisionUpstream(u, false)
-		// Track each upstream metric with the metrics tracker
-		for _, vec := range upstreamMetricVecs() {
-			ctx.MetricsTracker().RegisterMetric(vec, prometheus.Labels{"upstream": u.Dial})
-		}
 	}
 
 	if h.HealthChecks != nil {
@@ -440,10 +439,31 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		}
 	}
 
-	upstreamHealthyUpdater := newMetricsUpstreamsHealthyUpdater(h, ctx)
-	upstreamHealthyUpdater.init()
-
 	return nil
+}
+
+// MetricLabelKeys returns the custom metric label keys declared on this handler.
+func (h *Handler) MetricLabelKeys() []string {
+	keys := make([]string, 0, len(h.MetricLabels))
+	for k := range h.MetricLabels {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// RegisterMetrics registers the metrics for this handler with the registry and tracker.
+func (h *Handler) RegisterMetrics(union []string, ctx caddy.Context) {
+	metricsLogger = h.logger.Named("reverse_proxy.metrics")
+	vecs := selectReverseProxyVecs(union, ctx.GetMetricsRegistry())
+	provisionCustom := vecs.resolveCustomLabels(h.MetricLabels, caddy.NewReplacer())
+	for _, u := range h.Upstreams {
+		labels := mergeLabels(provisionCustom, prometheus.Labels{"upstream": u.Dial})
+		for _, vec := range vecs.metricVecs() {
+			ctx.MetricsTracker().RegisterMetric(vec, labels)
+		}
+	}
+
+	newMetricsUpstreamsHealthyUpdater(h).init()
 }
 
 // Cleanup cleans up the resources made by h.
@@ -460,6 +480,7 @@ func (h *Handler) Cleanup() error {
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	um := newUpstreamMetrics(h, repl)
 
 	// prepare the request for proxying; this is needed only once
 	clonedReq, err := h.prepareRequest(r, repl)
@@ -548,7 +569,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 
 		var done bool
-		done, proxyErr = h.proxyLoopIteration(clonedReq, r, w, proxyErr, start, retries, &prevUpstream, repl, reqHeader, reqHost, next)
+		done, proxyErr = h.proxyLoopIteration(clonedReq, r, w, proxyErr, start, retries, &prevUpstream, repl, reqHeader, reqHost, next, um)
 		if done {
 			break
 		}
@@ -579,7 +600,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 // It returns true when the loop is done and should break; false otherwise. The error value returned should
 // be assigned to the proxyErr value for the next iteration of the loop (or the error handled after break).
 func (h *Handler) proxyLoopIteration(r *http.Request, origReq *http.Request, w http.ResponseWriter, proxyErr error, start time.Time, retries int,
-	prevUpstream *string, repl *caddy.Replacer, reqHeader http.Header, reqHost string, next caddyhttp.Handler,
+	prevUpstream *string, repl *caddy.Replacer, reqHeader http.Header, reqHost string, next caddyhttp.Handler, um upstreamMetrics,
 ) (bool, error) {
 	// get the updated list of upstreams
 	upstreams := h.Upstreams
@@ -626,7 +647,7 @@ func (h *Handler) proxyLoopIteration(r *http.Request, origReq *http.Request, w h
 	// only count a redispatch if previous upstream was different and error was a connection error.
 	var dialErr DialError
 	if errors.As(proxyErr, &dialErr) && *prevUpstream != "" && *prevUpstream != upstream.Dial {
-		reverseProxyMetrics.upstreamRedispatches.With(prometheus.Labels{"upstream": upstream.Dial}).Inc()
+		um.vecs.upstreamRedispatches.With(um.labels(prometheus.Labels{"upstream": upstream.Dial})).Inc()
 	}
 	*prevUpstream = upstream.Dial
 
@@ -683,7 +704,7 @@ func (h *Handler) proxyLoopIteration(r *http.Request, origReq *http.Request, w h
 	}
 
 	// proxy the request to that upstream
-	proxyErr = h.reverseProxy(w, r, origReq, repl, dialInfo, next)
+	proxyErr = h.reverseProxy(w, r, origReq, repl, dialInfo, next, um)
 	if proxyErr == nil || errors.Is(proxyErr, context.Canceled) {
 		// context.Canceled happens when the downstream client
 		// cancels the request, which is not our failure
@@ -703,14 +724,14 @@ func (h *Handler) proxyLoopIteration(r *http.Request, origReq *http.Request, w h
 	// successfully - only the response content triggered a retry
 	if _, isRetryableResponse := proxyErr.(retryableResponseError); !isRetryableResponse {
 		h.countFailure(upstream)
-		reverseProxyMetrics.upstreamResponseErrors.With(prometheus.Labels{"upstream": upstream.Dial}).Inc()
+		um.vecs.upstreamResponseErrors.With(um.labels(prometheus.Labels{"upstream": upstream.Dial})).Inc()
 	}
 
 	// if we've tried long enough, break
 	if !h.LoadBalancing.tryAgain(h.ctx, start, retries, proxyErr, r, h.logger) {
 		return true, proxyErr
 	}
-	reverseProxyMetrics.upstreamRetries.With(prometheus.Labels{"upstream": upstream.Dial}).Inc()
+	um.vecs.upstreamRetries.With(um.labels(prometheus.Labels{"upstream": upstream.Dial})).Inc()
 
 	return false, proxyErr
 }
@@ -1039,23 +1060,23 @@ func (c countingReadCloser) Read(p []byte) (int, error) {
 // reverseProxy performs a round-trip to the given backend and processes the response with the client.
 // (This method is mostly the beginning of what was borrowed from the net/http/httputil package in the
 // Go standard library which was used as the foundation.)
-func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origReq *http.Request, repl *caddy.Replacer, di DialInfo, next caddyhttp.Handler) error {
+func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origReq *http.Request, repl *caddy.Replacer, di DialInfo, next caddyhttp.Handler, um upstreamMetrics) error {
 	_ = di.Upstream.Host.countRequest(1)
 
 	// Increment the in-flight request count
 	incInFlightRequest(di.Address)
 
-	requestLabels := prometheus.Labels{"upstream": di.Upstream.Dial}
-	reverseProxyMetrics.upstreamRequestsTotal.With(requestLabels).Inc()
-	reverseProxyMetrics.upstreamRequestsInFlight.With(requestLabels).Inc()
-	reverseProxyMetrics.upstreamLastSession.With(requestLabels).SetToCurrentTime()
+	requestLabels := um.labels(prometheus.Labels{"upstream": di.Upstream.Dial})
+	um.vecs.upstreamRequestsTotal.With(requestLabels).Inc()
+	um.vecs.upstreamRequestsInFlight.With(requestLabels).Inc()
+	um.vecs.upstreamLastSession.With(requestLabels).SetToCurrentTime()
 
 	//nolint:errcheck
 	defer func() {
 		di.Upstream.Host.countRequest(-1)
 		// Decrement the in-flight request count
 		decInFlightRequest(di.Address)
-		reverseProxyMetrics.upstreamRequestsInFlight.With(requestLabels).Dec()
+		um.vecs.upstreamRequestsInFlight.With(requestLabels).Dec()
 	}()
 
 	// point the request to this upstream
@@ -1074,7 +1095,7 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origRe
 	var tlsStart time.Time
 	var dnsStart time.Time
 	var gotConnTime time.Time
-	upstreamLabels := prometheus.Labels{"upstream": di.Upstream.Dial}
+	upstreamLabels := um.labels(prometheus.Labels{"upstream": di.Upstream.Dial})
 	trace := &httptrace.ClientTrace{
 		Got1xxResponse: func(code int, header textproto.MIMEHeader) error {
 			roundTripMutex.Lock()
@@ -1097,20 +1118,20 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origRe
 
 		ConnectStart: func(network, addr string) {
 			connectStart = time.Now()
-			reverseProxyMetrics.upstreamConnAttempts.With(upstreamLabels).Inc()
+			um.vecs.upstreamConnAttempts.With(upstreamLabels).Inc()
 		},
 		ConnectDone: func(network, addr string, err error) {
-			reverseProxyMetrics.upstreamConnectDuration.
-				With(prometheus.Labels{"upstream": di.Upstream.Dial, "status": durationStatus(err)}).
+			um.vecs.upstreamConnectDuration.
+				With(um.labels(prometheus.Labels{"upstream": di.Upstream.Dial, "status": durationStatus(err)})).
 				Observe(time.Since(connectStart).Seconds())
 			if err != nil {
-				reverseProxyMetrics.upstreamConnErrors.With(upstreamLabels).Inc()
+				um.vecs.upstreamConnErrors.With(upstreamLabels).Inc()
 			}
 		},
 		GotConn: func(info httptrace.GotConnInfo) {
 			gotConnTime = time.Now()
 			if info.Reused {
-				reverseProxyMetrics.upstreamConnReuses.With(upstreamLabels).Inc()
+				um.vecs.upstreamConnReuses.With(upstreamLabels).Inc()
 			}
 		},
 
@@ -1118,28 +1139,28 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origRe
 			dnsStart = time.Now()
 		},
 		DNSDone: func(info httptrace.DNSDoneInfo) {
-			reverseProxyMetrics.upstreamDNSDuration.
-				With(prometheus.Labels{"upstream": di.Upstream.Dial, "status": dnsStatus(info.Err)}).
+			um.vecs.upstreamDNSDuration.
+				With(um.labels(prometheus.Labels{"upstream": di.Upstream.Dial, "status": dnsStatus(info.Err)})).
 				Observe(time.Since(dnsStart).Seconds())
 		},
 		TLSHandshakeStart: func() {
 			tlsStart = time.Now()
 		},
 		TLSHandshakeDone: func(state tls.ConnectionState, err error) {
-			reverseProxyMetrics.upstreamTLSDuration.
-				With(prometheus.Labels{"upstream": di.Upstream.Dial, "status": tlsStatus(err)}).
+			um.vecs.upstreamTLSDuration.
+				With(um.labels(prometheus.Labels{"upstream": di.Upstream.Dial, "status": tlsStatus(err)})).
 				Observe(time.Since(tlsStart).Seconds())
 			if err != nil {
-				reverseProxyMetrics.upstreamTLSErrors.With(upstreamLabels).Inc()
+				um.vecs.upstreamTLSErrors.With(upstreamLabels).Inc()
 			} else {
-				reverseProxyMetrics.upstreamTLSHandshakes.
-					With(prometheus.Labels{"upstream": di.Upstream.Dial, "resumed": strconv.FormatBool(state.DidResume)}).
+				um.vecs.upstreamTLSHandshakes.
+					With(um.labels(prometheus.Labels{"upstream": di.Upstream.Dial, "resumed": strconv.FormatBool(state.DidResume)})).
 					Inc()
 			}
 		},
 		GotFirstResponseByte: func() {
 			if !gotConnTime.IsZero() {
-				reverseProxyMetrics.upstreamResponseDuration.
+				um.vecs.upstreamResponseDuration.
 					With(upstreamLabels).
 					Observe(time.Since(gotConnTime).Seconds())
 			} else if c := h.logger.Check(zapcore.WarnLevel, "dropped time-to-first-byte observation: GotConn did not fire"); c != nil {
@@ -1149,15 +1170,15 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origRe
 	}
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
 	if req.Body != nil {
-		req.Body = countingReadCloser{ReadCloser: req.Body, counter: reverseProxyMetrics.upstreamSentBytes.With(upstreamLabels)}
+		req.Body = countingReadCloser{ReadCloser: req.Body, counter: um.vecs.upstreamSentBytes.With(upstreamLabels)}
 	}
 
 	// do the round-trip
 	start := time.Now()
 	res, err := h.Transport.RoundTrip(req)
 	duration := time.Since(start)
-	reverseProxyMetrics.upstreamDuration.
-		With(prometheus.Labels{"upstream": di.Upstream.Dial, "status": durationStatus(err)}).
+	um.vecs.upstreamDuration.
+		With(um.labels(prometheus.Labels{"upstream": di.Upstream.Dial, "status": durationStatus(err)})).
 		Observe(duration.Seconds())
 
 	// record that the round trip is done for the 1xx response handler
@@ -1185,12 +1206,12 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origRe
 		return err
 	}
 
-	reverseProxyMetrics.upstreamResponsesTotal.With(prometheus.Labels{
+	um.vecs.upstreamResponsesTotal.With(um.labels(prometheus.Labels{
 		"upstream": di.Upstream.Dial,
 		"code":     caddymetrics.SanitizeCode(res.StatusCode),
-	}).Inc()
+	})).Inc()
 	if res.Body != nil {
-		res.Body = countingReadCloser{ReadCloser: res.Body, counter: reverseProxyMetrics.upstreamReceivedBytes.With(upstreamLabels)}
+		res.Body = countingReadCloser{ReadCloser: res.Body, counter: um.vecs.upstreamReceivedBytes.With(upstreamLabels)}
 	}
 
 	if c := logger.Check(zapcore.DebugLevel, logMessage); c != nil {
@@ -1306,6 +1327,7 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origRe
 			start:    start,
 			upstream: di.Upstream.Dial,
 			logger:   logger,
+			um:       um,
 		}
 		ctx := origReq.Context()
 		ctx = context.WithValue(ctx, proxyHandleResponseContextCtxKey, hrc)
@@ -1335,7 +1357,7 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origRe
 	}
 
 	// copy the response body and headers back to the upstream client
-	return h.finalizeResponse(rw, req, res, repl, start, di.Upstream.Dial, logger)
+	return h.finalizeResponse(rw, req, res, repl, start, di.Upstream.Dial, logger, um)
 }
 
 // finalizeResponse prepares and copies the response.
@@ -1347,6 +1369,7 @@ func (h *Handler) finalizeResponse(
 	start time.Time,
 	upstream string,
 	logger *zap.Logger,
+	um upstreamMetrics,
 ) error {
 	// deal with 101 Switching Protocols responses: (WebSocket, h2c, etc)
 	if res.StatusCode == http.StatusSwitchingProtocols {
@@ -1412,14 +1435,14 @@ func (h *Handler) finalizeResponse(
 		if c := logger.Check(zapcore.WarnLevel, "aborting with incomplete response"); c != nil {
 			c.Write(zap.Error(err))
 		}
-		abortLabels := prometheus.Labels{"upstream": upstream}
+		abortLabels := um.labels(prometheus.Labels{"upstream": upstream})
 		var rerr readError
 		var werr writeError
 		switch {
 		case errors.As(err, &rerr):
-			reverseProxyMetrics.upstreamServerAborts.With(abortLabels).Inc()
+			um.vecs.upstreamServerAborts.With(abortLabels).Inc()
 		case errors.As(err, &werr):
-			reverseProxyMetrics.upstreamClientAborts.With(abortLabels).Inc()
+			um.vecs.upstreamClientAborts.With(abortLabels).Inc()
 		}
 		// no extra logging from stdlib
 		panic(http.ErrAbortHandler)
@@ -1999,6 +2022,9 @@ type handleResponseContext struct {
 	// with the request, duration, and selected upstream attached.
 	logger *zap.Logger
 
+	// um carries the per-request metrics and resolved custom labels.
+	um upstreamMetrics
+
 	// isFinalized is whether the response has been finalized,
 	// i.e. copied and closed, to make sure that it doesn't
 	// happen twice.
@@ -2017,5 +2043,6 @@ var errNoUpstream = fmt.Errorf("no upstreams available")
 var (
 	_ caddy.Provisioner           = (*Handler)(nil)
 	_ caddy.CleanerUpper          = (*Handler)(nil)
+	_ caddy.CustomMetricLabeler   = (*Handler)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Handler)(nil)
 )

@@ -80,7 +80,7 @@ func (h CopyResponseHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request
 	hrc.isFinalized = true
 
 	// write the response
-	return hrc.handler.finalizeResponse(rw, req, hrc.response, repl, hrc.start, hrc.upstream, hrc.logger)
+	return hrc.handler.finalizeResponse(rw, req, hrc.response, repl, hrc.start, hrc.upstream, hrc.logger, hrc.um)
 }
 
 // CopyResponseHeadersHandler is a special HTTP handler which may
